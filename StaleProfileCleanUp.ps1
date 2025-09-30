@@ -1,88 +1,57 @@
-# StaleProfileCleanUp.ps1
-
-# This script identifies user profiles on Windows machines that have not been used
-# in the last 90 days. It uses a hybrid method: NTUSER.DAT timestamp (preferred),
-# WMI LastUseTime (fallback), or folder timestamp (last resort).
+# --- StaleProfileCleanUp.ps1 ---
+# Detects stale user profiles on Windows systems.
 # Exit code 1 = stale profiles found, Exit code 0 = none found.
+# -------------------------------------------------------------
 
-# Define the cutoff date (90 days ago from now)
-$Cutoff = (Get-Date).AddDays(-90)
+# Change this cutoff value for testing vs. production:
+#   (Get-Date).AddDays(-0)   → forces ALL profiles to look stale (TEST mode)
+#   (Get-Date).AddDays(-90)  → real 90-day stale detection (PRODUCTION mode)
+$Cutoff = (Get-Date).AddDays(-0)   # <<-- CHANGE HERE
 
-# List of accounts that should never be considered stale (system, admin, service accounts, etc.)
-#  IMPORTANT: CHANGE THESE TO WHAT TO TAILOR YOUR EXLUDED ACCOUNTS!!!
-
+# Excluded accounts that should never be flagged
 $ExcludeNames = @(
-    'LocalService',      # Example service account
-    'Administrator',   # Built-in admin account
-    'Public',          # Public profile
-    'Default',         # Default profile
-    'Default User',    # Default user profile
-    'WDAGUtilityAccount', # Windows Defender Application Guard account
-    'All Users',
-    'lapsadmin',       # Local admin managed by LAPS
-    'svc_*'            # Any account starting with svc_
+    'Administrator','Public','Default','Default User',
+    'WDAGUtilityAccount','All Users','lapsadmin','svc_*'
 )
 
-# Function to determine "last activity" of a profile
 function Get-ActivityTime($profile) {
-    # 1) Check NTUSER.DAT file timestamp (most reliable indicator of last login/logoff)
     $ntuser = Join-Path $profile.LocalPath 'NTUSER.DAT'
     if (Test-Path $ntuser) {
-        try {
-            $ntDate = [System.IO.File]::GetLastWriteTime($ntuser)
-            if ($ntDate -gt [datetime]'1900-01-01') { return $ntDate }
-        } catch { } # Ignore errors and move on
+        try { return [System.IO.File]::GetLastWriteTime($ntuser) } catch {}
     }
-
-    # 2) If NTUSER.DAT unavailable, fall back to WMI LastUseTime
     if ($profile.LastUseTime) {
-        try {
-            $wmiDate = [System.Management.ManagementDateTimeConverter]::ToDateTime($profile.LastUseTime)
-            if ($wmiDate -gt [datetime]'1900-01-01') { return $wmiDate }
-        } catch { } # Ignore invalid values
+        try { return [System.Management.ManagementDateTimeConverter]::ToDateTime($profile.LastUseTime) } catch {}
     }
-
-    # 3) If neither works, fall back to folder last write time
-    try {
-        $fld = Get-Item $profile.LocalPath -ErrorAction Stop
-        return $fld.LastWriteTime
-    } catch { return $null } # If folder missing, return null
+    try { return (Get-Item $profile.LocalPath).LastWriteTime } catch { return $null }
 }
 
-# Get all user profiles from WMI that meet basic eligibility rules
 $eligible = Get-CimInstance Win32_UserProfile | Where-Object {
-    $_.LocalPath -like 'C:\Users\*' -and              # Must be in C:\Users
-    -not $_.Special -and                              # Skip special system profiles
-    -not $_.Loaded -and                               # Skip profiles currently loaded (in use)
-    $null -ne $_.LocalPath -and                       # Must have a valid path
-    ($ExcludeNames -notcontains (Split-Path $_.LocalPath -Leaf)) # Skip excluded accounts
+    $_.LocalPath -like 'C:\Users\*' -and
+    -not $_.Special -and
+    -not $_.Loaded -and
+    $null -ne $_.LocalPath -and
+    ($ExcludeNames -notcontains (Split-Path $_.LocalPath -Leaf))
 }
 
-# For each eligible profile, determine last activity and filter out those older than cutoff
 $stale = foreach ($p in $eligible) {
-    $last = Get-ActivityTime $p                       # Get last activity time
-    if ($last -and $last -lt $Cutoff) {               # If older than cutoff, mark as stale
+    $last = Get-ActivityTime $p
+    if ($last -and $last -lt $Cutoff) {
         [PSCustomObject]@{
-            UserName = Split-Path $p.LocalPath -Leaf  # Extract username from folder path
-            LastUse  = $last                          # Last activity date
-            Path     = $p.LocalPath                   # Full profile path
-            Source   = if (Test-Path (Join-Path $p.LocalPath 'NTUSER.DAT')) { 
-                          'NTUSER.DAT'                # Note if NTUSER.DAT was used
-                       } else { 
-                          'Fallback'                  # Otherwise WMI or folder time
-                       }
+            UserName = Split-Path $p.LocalPath -Leaf
+            LastUse  = $last
+            Path     = $p.LocalPath
+            Source   = if (Test-Path (Join-Path $p.LocalPath 'NTUSER.DAT')) { 'NTUSER.DAT' } else { 'Fallback' }
         }
     }
 }
 
-# If stale profiles were found, display and export results
 if ($stale) {
-    $stale | Sort-Object LastUse | Format-Table -AutoSize   # Show sorted table on screen
-    $csv = "C:\ProgramData\StaleProfiles_{0:yyyyMMdd_HHmmss}.csv" -f (Get-Date) # Filename
-    $stale | Export-Csv -NoTypeInformation -Path $csv       # Export report to CSV
-    Write-Host "`nSaved report to: $csv"                    # Tell user where report is saved
-    exit 1   # Signal "non-compliant" (stale profiles exist)
+    $stale | Sort-Object LastUse | Format-Table -AutoSize
+    $csv = "C:\ProgramData\StaleProfiles_{0:yyyyMMdd_HHmmss}.csv" -f (Get-Date)
+    $stale | Export-Csv -NoTypeInformation -Path $csv
+    Write-Host "`nSaved report to: $csv"
+    exit 1
 } else {
-    Write-Host "No stale profiles older than 90 days (hybrid check)." # Nothing found
-    exit 0   # Signal "compliant" (no stale profiles)
+    Write-Host "No stale profiles older than cutoff."
+    exit 0
 }
